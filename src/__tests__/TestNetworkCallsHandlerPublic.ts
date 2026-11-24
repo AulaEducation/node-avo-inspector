@@ -5,65 +5,49 @@ import { defaultOptions } from "./constants";
 
 describe("AvoNetworkCallsHandler", () => {
   let inspectorCallSpy: jest.SpyInstance<any, unknown[]>;
+  let consoleLogSpy: jest.SpyInstance<any, unknown[]>;
 
   let inspector: AvoInspector;
 
-  let inspectorCallResolvedCount = 0;
-
   const { apiKey, env, version, appName } = defaultOptions;
+
+  const eventName = "event name";
+  const properties = {
+    prop0: "",
+    prop2: false,
+    prop3: 0,
+    prop4: 0.0,
+  };
+
+  const happyPathInspectorCall = () => {
+    return Promise.resolve();
+  };
 
   beforeAll(() => {
     inspector = new AvoInspector(defaultOptions);
-    inspector.enableLogging(false);
+    inspector.enableLogging(true);
 
     inspectorCallSpy = jest
       .spyOn(AvoNetworkCallsHandler.prototype as any, "callInspectorWithBatchBody");
 
-    inspectorCallSpy.mockImplementation(() => {
-        inspector.avoNetworkCallsHandler["samplingRate"] = 0.1;
-        return new Promise<void>((resolve) => process.nextTick(() => {
-          inspectorCallResolvedCount += 1;
-          resolve();
-        }))
-      });
+    consoleLogSpy = jest.spyOn(console, "log").mockImplementation(() => {});
   });
 
+  beforeEach(() => {
+    inspectorCallSpy.mockImplementation(happyPathInspectorCall);
+  })
+
   afterEach(() => {
-    inspectorCallResolvedCount = 0;
     jest.clearAllMocks();
     // @ts-ignore
     inspector.avoDeduplicator._clearEvents();
   });
 
-  test("callInspectorWithBatchBody is called for sessionStarted and event types on trackSchemaFromEvent", async () => {
-    const eventName = "event name";
-    const properties = {
-      prop0: "",
-      prop2: false,
-      prop3: 0,
-      prop4: 0.0,
-    };
+  test("trackSchemaFromEvent sends only event call (no sessionStarted)", async () => {
+    await inspector.trackSchemaFromEvent({ eventName, eventProperties: properties });
 
-    await inspector.trackSchemaFromEvent(eventName, properties);
-
-    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledTimes(2);
-    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toBeCalledWith([
-      expect.objectContaining({
-        type: "sessionStarted",
-        apiKey: apiKey,
-        appName: appName,
-        appVersion: version,
-        libVersion: expect.anything(),
-        env: env,
-        libPlatform: "node",
-        messageId: expect.anything(),
-        trackingId: "",
-        createdAt: expect.any(String),
-        sessionId: expect.anything(),
-        samplingRate: 1,
-      }),
-    ]
-    );
+    // Should be called once (event only, no sessionStarted)
+    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledTimes(1);
     expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledWith([
       expect.objectContaining({
         type: "event",
@@ -74,28 +58,70 @@ describe("AvoNetworkCallsHandler", () => {
         env: env,
         libPlatform: "node",
         messageId: expect.anything(),
-        trackingId: "",
-        createdAt: expect.anything(),
-        sessionId: expect.anything(),
-        samplingRate: 0.1,
+        anonymousId: "",
+        createdAt: expect.any(String),
+        samplingRate: 1,
       }),
     ]);
-
-    expect(inspectorCallResolvedCount).toEqual(2);
   });
 
-  test("handleTrackSchema is called on _avoFunctionTrackSchemaFromEvent", async () => {
-    const eventName = "event name";
-    const properties = {
-      prop0: "",
-      prop2: false,
-      prop3: 0,
-      prop4: 0.0,
-    };
+  test("trackSchemaFromEvent resolves only after its immediate send completes", async () => {
+    let resolveInspectorCall!: () => void;
+    inspectorCallSpy.mockImplementationOnce(
+      () => new Promise<void>((resolve) => { resolveInspectorCall = resolve; })
+    );
+
+    let trackResolved = false;
+    const track = inspector
+      .trackSchemaFromEvent({ eventName, eventProperties: properties })
+      .then(() => { trackResolved = true; });
+
+    await Promise.resolve();
+    expect(trackResolved).toBe(false);
+
+    resolveInspectorCall();
+    await track;
+    expect(trackResolved).toBe(true);
+  });
+
+  test("trackSchemaFromEvent with streamId sets anonymousId to streamId", async () => {
+    await inspector.trackSchemaFromEvent({ eventName, eventProperties: properties, streamId: "user-stream-123" });
+
+    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledTimes(1);
+    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledWith([
+      expect.objectContaining({
+        type: "event",
+        anonymousId: "user-stream-123",
+      }),
+    ]);
+  });
+
+  test("trackSchemaFromEvent without streamId sets anonymousId to empty string", async () => {
+    await inspector.trackSchemaFromEvent({ eventName, eventProperties: properties });
+
+    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledTimes(1);
+    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledWith([
+      expect.objectContaining({
+        anonymousId: "",
+      }),
+    ]);
+  });
+
+  test("trackSchemaFromEvent with streamId containing ':' logs warning", async () => {
+    const consoleWarnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    await inspector.trackSchemaFromEvent({ eventName, eventProperties: properties, streamId: "invalid:stream" });
+
+    expect(consoleWarnSpy).toHaveBeenCalledWith(
+      "[Avo Inspector] Warning: streamId contains ':' which is not supported"
+    );
+
+    consoleWarnSpy.mockRestore();
+  });
+
+  test("_avoFunctionTrackSchemaFromEvent sends only event call (no sessionStarted)", async () => {
     const eventId = "testId";
     const eventHash = "testHash";
-
-    const schema = inspector.extractSchema(properties);
 
     // @ts-ignore
     await inspector._avoFunctionTrackSchemaFromEvent(
@@ -105,24 +131,8 @@ describe("AvoNetworkCallsHandler", () => {
       eventHash
     );
 
-    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledTimes(2);
-    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toBeCalledWith([
-      expect.objectContaining({
-        type: "sessionStarted",
-        apiKey: apiKey,
-        appName: appName,
-        appVersion: version,
-        libVersion: expect.anything(),
-        env: env,
-        libPlatform: "node",
-        messageId: expect.anything(),
-        trackingId: "",
-        createdAt: expect.anything(),
-        sessionId: expect.anything(),
-        samplingRate: 0.1,
-      })
-    ]
-    );
+    // Should be called once (event only, no sessionStarted)
+    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledTimes(1);
     expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledWith([
       expect.objectContaining({
         type: "event",
@@ -133,11 +143,86 @@ describe("AvoNetworkCallsHandler", () => {
         env: env,
         libPlatform: "node",
         messageId: expect.anything(),
-        trackingId: "",
-        createdAt: expect.anything(),
-        sessionId: expect.anything(),
-        samplingRate: 0.1,
+        anonymousId: "",
+        createdAt: expect.any(String),
       }),
     ]);
+  });
+
+  test("an error is logged if event schema call fails and AvoInspector.shouldLog is true", async () => {
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    inspectorCallSpy.mockRejectedValueOnce('Network error');
+
+    await inspector.trackSchemaFromEvent({ eventName, eventProperties: properties });
+
+    // A reason other than the two fixed transport texts prints only its type.
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Avo Inspector: schema sending failed: Request failed (string).');
+    consoleErrorSpy.mockRestore();
+  });
+
+  test("_avoFunctionTrackSchemaFromEvent passes empty string as anonymousId", async () => {
+    const eventId = "testId";
+    const eventHash = "testHash";
+
+    // @ts-ignore
+    await inspector._avoFunctionTrackSchemaFromEvent(
+      eventName,
+      properties,
+      eventId,
+      eventHash
+    );
+
+    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledWith([
+      expect.objectContaining({
+        anonymousId: "",
+      }),
+    ]);
+  });
+
+  test("trackSchemaFromEvent with streamId containing ':' still sends the event", async () => {
+    const consoleWarnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    await inspector.trackSchemaFromEvent({ eventName, eventProperties: properties, streamId: "bad:stream" });
+
+    // Warning is logged
+    expect(consoleWarnSpy).toHaveBeenCalledWith(
+      "[Avo Inspector] Warning: streamId contains ':' which is not supported"
+    );
+
+    // Event is still sent despite the warning
+    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledTimes(1);
+    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledWith([
+      expect.objectContaining({
+        type: "event",
+        anonymousId: "bad:stream",
+      }),
+    ]);
+
+    consoleWarnSpy.mockRestore();
+  });
+
+  test("same event with different streamIds is not deduplicated", async () => {
+    await inspector.trackSchemaFromEvent({ eventName, eventProperties: properties, streamId: "stream-a" });
+    await inspector.trackSchemaFromEvent({ eventName, eventProperties: properties, streamId: "stream-b" });
+
+    expect(inspector.avoNetworkCallsHandler.callInspectorWithBatchBody).toHaveBeenCalledTimes(2);
+  });
+
+  test("trackSchemaFromEvent rejection contains the expected error string", async () => {
+    const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    // Force the catch block in trackSchemaFromEvent by making extractSchema throw
+    jest.spyOn(inspector, "extractSchema").mockImplementation(() => {
+      throw new Error("test explosion");
+    });
+
+    await expect(
+      inspector.trackSchemaFromEvent({ eventName, eventProperties: properties })
+    ).rejects.toBe(
+      "Avo Inspector: something went wrong. Please report to support@avo.app."
+    );
+
+    consoleErrorSpy.mockRestore();
+    (inspector.extractSchema as jest.Mock).mockRestore();
   });
 });
